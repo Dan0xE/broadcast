@@ -1,17 +1,22 @@
+use crossterm::event::KeyEvent;
 use std::{
     env,
-    io::{self, Write},
+    io::{IsTerminal, Write, stdout},
+    time::Duration,
 };
-use tokio::io::AsyncWriteExt;
+use terminput::Encoding;
+use terminput_crossterm::to_terminput;
 use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, task::JoinHandle};
 use tracing::Level;
 
 // TODO have install command, that downloads the server trough "broadcast setup"
 // TODO give the user a command to setup aliases in their shell (broadcast install -c "command" -a "alias")
 // The user should be able to choose the wsl distribution to install to (nice menu for that)
-// TODO figure interactive commands out (anything that needs user input)
 // TODO have edit config command so config can be edited from windows
-use broadcast_protocol::{CommandRequest, CommandResponse, PORT};
+use broadcast_protocol::{
+    ClientMessage, CommandRequest, CommandResponse, PORT, decode_msg, encode_msg,
+};
 use clap::Parser;
 
 #[derive(clap::Parser, Debug)]
@@ -26,77 +31,171 @@ struct Args {
         help = "The command to broadcast"
     )]
     command: Vec<String>,
+    #[arg(short, long, help = "Enable verbose output")]
+    verbose: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
-enum ClientErrors {
+enum ClientError {
     #[error("IO Error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Protocol Error: {0}")]
-    ProtocolError(#[from] broadcast_protocol::ProtcolError),
+    ProtocolError(#[from] broadcast_protocol::ProtocolError),
+    #[error("Join Error: {0}")]
+    JoinError(#[from] tokio::task::JoinError),
 }
 
-type ClientResult<T> = Result<T, ClientErrors>;
+type ClientResult<T> = Result<T, ClientError>;
 
 #[tokio::main]
 async fn main() -> ClientResult<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    let level = if args.verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
+
+    tracing_subscriber::fmt().with_max_level(level).init();
 
     let cmd = args.command.join(" ");
 
     let cwd = env::current_dir()?.to_string_lossy().to_string();
-    // everytihng followed after the first
+
+    let stdin_is_tty = std::io::stdin().is_terminal();
 
     let addr = format!("127.0.0.1:{}", PORT);
     let mut stream = TcpStream::connect(&addr).await?;
 
+    let terminal_size = if stdin_is_tty {
+        use crossterm::terminal;
+        terminal::size().ok()
+    } else {
+        None
+    };
+
     let request = CommandRequest {
         command: cmd.clone(),
         working_dir: cwd,
+        terminal_size,
     };
 
     let msg = broadcast_protocol::encode_msg(&request)?;
     stream.write_all(&msg).await?;
 
-    let exit_code = handle_response(&mut stream).await?;
+    let exit_code = handle_response(stream, stdin_is_tty).await?;
     std::process::exit(exit_code);
 }
 
-async fn handle_response(stream: &mut TcpStream) -> ClientResult<i32> {
-    let stdout = io::stdout();
-    let stderr = io::stderr();
+async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<i32> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+        terminal::{disable_raw_mode, enable_raw_mode},
+    };
 
-    let mut stdout_handle = stdout.lock();
-    let mut stderr_handle = stderr.lock();
+    if stdin_is_tty {
+        enable_raw_mode()?
+    }
 
-    loop {
-        match broadcast_protocol::decode_msg::<CommandResponse>(stream).await {
-            Ok(response) => match response {
-                CommandResponse::Stdout(data) => {
-                    stdout_handle.write_all(&data)?;
-                    stdout_handle.flush()?;
+    let (mut stream_read, mut stream_write) = stream.into_split();
+
+    let output_task: JoinHandle<ClientResult<i32>> = tokio::spawn(async move {
+        let mut stdout = stdout();
+
+        loop {
+            match decode_msg::<CommandResponse>(&mut stream_read).await {
+                Ok(response) => {
+                    match response {
+                        CommandResponse::Stdout(data) => {
+                            stdout.write_all(&data)?;
+                            stdout.flush()?;
+                        }
+                        CommandResponse::Exit(code) => return Ok(code),
+                        CommandResponse::Error(e) => {
+                            tracing::error!("Server error: {}", e);
+                            return Ok(1);
+                        }
+                        CommandResponse::Stderr(_) => {
+                            // TODO stderr is merged with stdout in pty, how can we handle this properly
+                        }
+                    }
                 }
-                CommandResponse::Stderr(data) => {
-                    stderr_handle.write_all(&data)?;
-                    stderr_handle.flush()?;
-                }
-                CommandResponse::Exit(code) => {
-                    return Ok(code);
-                }
-                CommandResponse::Error(msg) => {
-                    tracing::error!("Server Error: {}", msg);
+                Err(_) => {
+                    // Connection closed
+                    tracing::warn!("Connection closed by server");
                     return Ok(1);
                 }
-            },
-            Err(e) => {
-                if e.to_string().contains("UnexpectedEof") {
-                    tracing::error!("Connection closed unexpectedly");
-                    return Ok(1);
-                }
-                return Err(e.into());
             }
+        }
+    });
+
+    let input_task = tokio::spawn(async move {
+        loop {
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    }) => {
+                        let msg = encode_msg(&ClientMessage::Input(vec![3]))?;
+                        stream_write.write_all(&msg).await?;
+                        break;
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('d'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    }) => {
+                        let msg = encode_msg(&ClientMessage::Eof)?;
+                        stream_write.write_all(&msg).await?;
+                        break;
+                    }
+                    Event::Key(key_event) => {
+                        if key_event.kind != event::KeyEventKind::Press {
+                            continue;
+                        }
+
+                        if let Some(bytes) = key_event.to_bytes() {
+                            let msg = encode_msg(&ClientMessage::Input(bytes))?;
+                            stream_write.write_all(&msg).await?;
+                        }
+                    }
+                    Event::Resize(cols, rows) => {
+                        let msg = encode_msg(&ClientMessage::Resize(rows, cols))?;
+                        stream_write.write_all(&msg).await?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok::<_, ClientError>(())
+    });
+
+    let exit_code = output_task.await??;
+
+    input_task.abort();
+    if stdin_is_tty {
+        disable_raw_mode()?
+    }
+
+    Ok(exit_code)
+}
+
+trait KeyEventExt {
+    fn to_bytes(&self) -> Option<Vec<u8>>;
+}
+
+impl KeyEventExt for KeyEvent {
+    fn to_bytes(&self) -> Option<Vec<u8>> {
+        let term_event = to_terminput(crossterm::event::Event::Key(*self)).ok()?;
+
+        let mut buf = [0u8; 32];
+
+        match term_event.encode(&mut buf, Encoding::Xterm) {
+            Ok(len) => Some(buf[..len].to_vec()),
+            Err(_) => None,
         }
     }
 }

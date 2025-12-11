@@ -10,3 +10,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29.0"
+terminput = "0.5.11"
+terminput-crossterm = "0.4.7"

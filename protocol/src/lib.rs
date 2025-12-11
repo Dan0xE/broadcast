@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 pub struct CommandRequest {
     pub command: String,
     pub working_dir: String,
+    pub terminal_size: Option<(u16, u16)>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Decode, Encode)]
+pub enum ClientMessage {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    Eof,
 }
 
 #[derive(Serialize, Deserialize, Debug, Decode, Encode)]
@@ -16,7 +24,7 @@ pub enum CommandResponse {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum ProtcolError {
+pub enum ProtocolError {
     #[error("Encode Error: {0}")]
     EncodeError(#[from] BincodeError::EncodeError),
     #[error("Decode Error: {0}")]
@@ -25,7 +33,7 @@ pub enum ProtcolError {
     IoError(#[from] std::io::Error),
 }
 
-pub type ProtocolResult<T> = Result<T, ProtcolError>;
+pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
 // TODO this should not be inside of the protocol crate
 pub const PORT: u16 = 9877;
@@ -53,7 +61,7 @@ pub async fn decode_msg<T: Decode<()>>(
     reader.read_exact(&mut buf).await?;
 
     let config = bincode::config::standard();
-    let (decoded, _size): (T, usize) = bincode::decode_from_slice(&buf, config)?;
+    let decoded: T = bincode::decode_from_slice(&buf, config)?.0;
 
     Ok(decoded)
 }
