@@ -1,0 +1,12 @@
+[package]
+name = "broadcast_client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+broadcast_protocol = { path = "../protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }

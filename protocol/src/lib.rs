@@ -1,0 +1,59 @@
+use bincode::{Decode, Encode, error as BincodeError};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Decode, Encode)]
+pub struct CommandRequest {
+    pub command: String,
+    pub working_dir: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Decode, Encode)]
+pub enum CommandResponse {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(i32),
+    Error(String),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProtcolError {
+    #[error("Encode Error: {0}")]
+    EncodeError(#[from] BincodeError::EncodeError),
+    #[error("Decode Error: {0}")]
+    DecodeError(#[from] BincodeError::DecodeError),
+    #[error("IO Error: {0}")]
+    IoError(#[from] std::io::Error),
+}
+
+pub type ProtocolResult<T> = Result<T, ProtcolError>;
+
+// TODO this should not be inside of the protocol crate
+pub const PORT: u16 = 9877;
+
+pub fn encode_msg<T: Encode>(msg: &T) -> ProtocolResult<Vec<u8>> {
+    let config = bincode::config::standard();
+    let data = bincode::encode_to_vec(msg, config)?;
+    let len = (data.len() as u32).to_be_bytes();
+
+    let mut result = Vec::with_capacity(4 + data.len());
+    result.extend_from_slice(&len);
+    result.extend_from_slice(&data);
+
+    Ok(result)
+}
+
+pub async fn decode_msg<T: Decode<()>>(
+    reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+) -> ProtocolResult<T> {
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).await?;
+    let len = u32::from_be_bytes(len_bytes);
+
+    let mut buf = vec![0u8; len as usize];
+    reader.read_exact(&mut buf).await?;
+
+    let config = bincode::config::standard();
+    let (decoded, _size): (T, usize) = bincode::decode_from_slice(&buf, config)?;
+
+    Ok(decoded)
+}
