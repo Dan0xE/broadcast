@@ -35,18 +35,19 @@ struct Args {
     verbose: bool,
     #[arg(short, long, help = "Enable debug logging to file")]
     debug: bool,
+    // shell, can overwrite default / config value
 }
 
 #[derive(thiserror::Error, Debug)]
 enum ClientError {
     #[error("IO Error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
     #[error("Protocol Error: {0}")]
-    ProtocolError(#[from] broadcast_protocol::ProtocolError),
+    Protocol(#[from] broadcast_protocol::ProtocolError),
     #[error("Join Error: {0}")]
-    JoinError(#[from] tokio::task::JoinError),
+    Join(#[from] tokio::task::JoinError),
     #[error("Log Setup Error: {0}")]
-    LogSetupError(#[from] tracing::subscriber::SetGlobalDefaultError),
+    LogSetup(#[from] tracing::subscriber::SetGlobalDefaultError),
 }
 
 type ClientResult<T> = Result<T, ClientError>;
@@ -76,13 +77,14 @@ async fn main() -> ClientResult<()> {
     let request = CommandRequest {
         command: cmd.clone(),
         working_dir: cwd,
-        terminal_size,
+        // NOTE The input task needs to send the actual terminal size later
+        terminal_size: None,
     };
 
     let msg = broadcast_protocol::encode_msg(&request)?;
     stream.write_all(&msg).await?;
 
-    let exit_code = handle_response(stream, stdin_is_tty).await?;
+    let exit_code = handle_response(stream, stdin_is_tty, terminal_size).await?;
     std::process::exit(exit_code);
 }
 
@@ -90,19 +92,17 @@ fn setup_logging(
     debug: bool,
     verbose: bool,
 ) -> ClientResult<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    let level = if debug || verbose {
-        Level::DEBUG
-    } else {
-        Level::INFO
-    };
+    let dbg = debug || verbose;
+    let level = if dbg { Level::DEBUG } else { Level::INFO };
 
-    if debug {
+    if dbg {
         let file_appender = tracing_appender::rolling::daily("logs", "broadcast-client.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
         tracing_subscriber::fmt()
             .with_max_level(level)
             .with_writer(non_blocking)
+            .with_ansi(false)
             .init();
 
         tracing::debug!("Debug logging enabled");
@@ -113,7 +113,11 @@ fn setup_logging(
     Ok(None)
 }
 
-async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<i32> {
+async fn handle_response(
+    stream: TcpStream,
+    stdin_is_tty: bool,
+    terminal_size: Option<(u16, u16)>,
+) -> ClientResult<i32> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
         terminal::{disable_raw_mode, enable_raw_mode},
@@ -130,22 +134,19 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
 
         loop {
             match decode_msg::<CommandResponse>(&mut stream_read).await {
-                Ok(response) => {
-                    match response {
-                        CommandResponse::Stdout(data) => {
-                            stdout.write_all(&data)?;
-                            stdout.flush()?;
-                        }
-                        CommandResponse::Exit(code) => return Ok(code),
-                        CommandResponse::Error(e) => {
-                            tracing::error!("Server error: {}", e);
-                            return Ok(1);
-                        }
-                        CommandResponse::Stderr(_) => {
-                            // TODO stderr is merged with stdout in pty, how can we handle this properly
-                        }
+                Ok(response) => match response {
+                    CommandResponse::Stdout(data) => {
+                        stdout.write_all(&data)?;
+                        stdout.flush()?;
                     }
-                }
+                    CommandResponse::Exit(code) => return Ok(code),
+                    CommandResponse::Error(e) => {
+                        tracing::error!("Server error: {}", e);
+                        return Ok(1);
+                    }
+                    // Stderr is merged
+                    _ => {}
+                },
                 Err(_) => {
                     // Connection closed
                     tracing::warn!("Connection closed by server");
@@ -156,6 +157,17 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
     });
 
     let input_task = tokio::spawn(async move {
+        // Send initial size
+        if let Some((cols, rows)) = terminal_size {
+            tracing::debug!(
+                "Initial resize: setting size to {} cols and {} rows",
+                cols,
+                rows
+            );
+            let msg = encode_msg(&ClientMessage::Resize(rows, cols))?;
+            stream_write.write_all(&msg).await?;
+        }
+
         loop {
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
@@ -188,6 +200,7 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
                         }
                     }
                     Event::Resize(cols, rows) => {
+                        tracing::debug!("Resize event: resized to {} cols and {} rows", cols, rows);
                         let msg = encode_msg(&ClientMessage::Resize(rows, cols))?;
                         stream_write.write_all(&msg).await?;
                     }
@@ -208,10 +221,14 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
     Ok(exit_code)
 }
 
+// FIXME this doesn't seem to work well with VIM
+// Vim does this weird thing where it will try to query the terminal for its size?
+
 trait KeyEventExt {
     fn to_bytes(&self) -> Option<Vec<u8>>;
 }
 
+// Forgot the issues that mentioned it, but not a trivial issue fix
 impl KeyEventExt for KeyEvent {
     fn to_bytes(&self) -> Option<Vec<u8>> {
         let term_event = to_terminput(crossterm::event::Event::Key(*self)).ok()?;

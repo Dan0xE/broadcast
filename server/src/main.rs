@@ -12,15 +12,15 @@ use tracing::Level;
 #[derive(thiserror::Error, Debug)]
 pub enum ServerError {
     #[error("IO Error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
     #[error("Join Error: {0}")]
-    JoinError(#[from] tokio::task::JoinError),
+    Join(#[from] tokio::task::JoinError),
     #[error("Protocol Error: {0}")]
-    ProtocolError(#[from] broadcast_protocol::ProtocolError),
+    Protocol(#[from] broadcast_protocol::ProtocolError),
     #[error("Invalid Path Error: {0}")]
-    InvalidPathError(String),
+    InvalidPath(String),
     #[error("PTY Error: {0}")]
-    PtyError(#[from] anyhow::Error),
+    Pty(#[from] anyhow::Error),
 }
 
 pub type ServerResult<T> = Result<T, ServerError>;
@@ -28,7 +28,9 @@ pub type ServerResult<T> = Result<T, ServerError>;
 #[tokio::main]
 async fn main() -> ServerResult<()> {
     // TODO change this and make configurable
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .init();
 
     let addr = format!("127.0.0.1:{}", PORT);
     let listener = TcpListener::bind(&addr).await?;
@@ -85,9 +87,9 @@ async fn handle_command(socket: TcpStream, req: CommandRequest) -> ServerResult<
     // TODO shell make configurable from the client
     let shell = "sh";
     let mut cmd = CommandBuilder::new(shell);
+    cmd.cwd(&req.working_dir);
     cmd.arg("-c");
     cmd.arg(&req.command);
-    cmd.arg(&req.working_dir);
 
     let mut child = pair.slave.spawn_command(cmd)?;
 
@@ -109,11 +111,17 @@ async fn handle_command(socket: TcpStream, req: CommandRequest) -> ServerResult<
             match reader.read(&mut buffer) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    if out_tx.send(buffer[..n].to_vec()).is_err() {
+                    let data = buffer[..n].to_vec();
+
+                    if let Err(e) = out_tx.send(data) {
+                        tracing::error!("Failed to send output to channel: {e}");
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::error!("PTY read error: {}", e);
+                    break;
+                }
             }
         }
     });
@@ -139,6 +147,8 @@ async fn handle_command(socket: TcpStream, req: CommandRequest) -> ServerResult<
                             writer.flush()?;
                             Ok(())
                         })?;
+
+                        tracing::debug!("Wrote {} bytes to PTY", data.len());
                     }
                     ClientMessage::Resize(rows, cols) => {
                         let size = PtySize {
@@ -148,12 +158,16 @@ async fn handle_command(socket: TcpStream, req: CommandRequest) -> ServerResult<
                             pixel_height: 0,
                         };
                         pty_master.resize(size)?;
+                        tracing::debug!("Resized PTY to {} rows and {} cols", rows, cols);
                     }
                     ClientMessage::Eof => {
+                        tracing::debug!("Received EOF from client, terminating session");
                         break;
                     }
                 },
-                Err(_) => {
+                Err(e) => {
+                    tracing::error!("Error reading from socket: {}", e);
+                    tracing::error!("Assuming client disconnected, terminating session");
                     break; // Client disconnected
                 }
             }
@@ -178,21 +192,19 @@ async fn handle_command(socket: TcpStream, req: CommandRequest) -> ServerResult<
 fn convert_win_to_wsl_path(win_path: &str) -> ServerResult<String> {
     let mut chars = win_path.chars();
     let Some(next) = chars.next() else {
-        return Err(ServerError::InvalidPathError(format!(
-            "Empty path provided"
-        )));
+        return Err(ServerError::InvalidPath("Empty path provided".to_string()));
     };
     let drive_letter = next.to_ascii_lowercase();
     let rest_of_path: String = chars.collect();
     let rest_of_path = rest_of_path.replace('\\', "/");
     let converted_path = format!(
-        "/mnt/{}/{}",
+        "/mnt/{}{}",
         drive_letter,
         rest_of_path.trim_start_matches(':')
     );
 
     if !PathBuf::from(&converted_path).exists() {
-        return Err(ServerError::InvalidPathError(format!(
+        return Err(ServerError::InvalidPath(format!(
             "Converted path '{}' is invalid",
             converted_path
         )));
@@ -208,12 +220,12 @@ mod tests {
     #[test]
     fn test_path_conversion() {
         assert_eq!(
-            convert_win_to_wsl_path("C:\\Users\\Username").unwrap(),
-            "/mnt/c/Users/Username"
+            convert_win_to_wsl_path("C:\\Users").unwrap(),
+            "/mnt/c/Users"
         );
         assert_eq!(
-            convert_win_to_wsl_path("D:\\Projects\\Test").unwrap(),
-            "/mnt/d/Projects/Test"
+            convert_win_to_wsl_path("D:\\Projects\\Dan0xe\\Code\\Broadcast").unwrap(),
+            "/mnt/d/Projects/Dan0xe/Code/Broadcast"
         );
 
         assert!(convert_win_to_wsl_path("").is_err());

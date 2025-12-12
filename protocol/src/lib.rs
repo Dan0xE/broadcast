@@ -26,11 +26,11 @@ pub enum CommandResponse {
 #[derive(thiserror::Error, Debug)]
 pub enum ProtocolError {
     #[error("Encode Error: {0}")]
-    EncodeError(#[from] BincodeError::EncodeError),
+    Encode(#[from] BincodeError::EncodeError),
     #[error("Decode Error: {0}")]
-    DecodeError(#[from] BincodeError::DecodeError),
+    Decode(#[from] BincodeError::DecodeError),
     #[error("IO Error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 }
 
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
