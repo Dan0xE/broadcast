@@ -1,8 +1,9 @@
+use futures::StreamExt;
 use std::{
     env,
     io::{IsTerminal, Write, stdout},
 };
-use termina::Terminal as _;
+use termina::{EventStream, Terminal as _};
 use tokio::net::TcpStream;
 use tokio::{io::AsyncWriteExt, task::JoinHandle};
 use tracing::Level;
@@ -114,40 +115,29 @@ fn setup_logging(
 }
 
 struct RawModeGuard {
-    enabled: bool,
+    term_handle: Option<termina::PlatformTerminal>,
 }
 
 impl RawModeGuard {
     fn new(enable: bool) -> ClientResult<Self> {
-        if enable {
-            crossterm::terminal::enable_raw_mode()?;
-        }
-        Ok(Self { enabled: enable })
+        let term_handle = if enable {
+            Some(termina::PlatformTerminal::new()?)
+        } else {
+            None
+        };
+
+        Ok(Self { term_handle })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        if self.enabled {
-            use crossterm::{
-                cursor, execute,
-                terminal::{self, Clear, ClearType},
-            };
+        let Some(ref mut term_handle) = self.term_handle else {
+            return;
+        };
 
-            let mut stdout = stdout();
-
-            if let Err(e) = terminal::disable_raw_mode() {
-                tracing::error!("Failed to disable raw mode: {}", e);
-            }
-
-            if let Err(e) = execute!(
-                stdout,
-                terminal::LeaveAlternateScreen,
-                cursor::Show,
-                Clear(ClearType::All),
-            ) {
-                tracing::error!("Failed to reset terminal state: {}", e);
-            }
+        if let Err(e) = term_handle.enter_cooked_mode() {
+            tracing::error!("Failed to disable raw mode: {}", e);
         }
     }
 }
@@ -191,10 +181,15 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
         }
     });
 
+    let local_set = tokio::task::LocalSet::new();
+
     let input_task = if let Some(term) = terminal {
-        tokio::task::spawn_blocking(move || {
-            loop {
-                let event = match term.read(|_| true) {
+        let event_reader = term.event_reader();
+        let mut event_stream = EventStream::new(event_reader, |_| true);
+
+        local_set.spawn_local(async move {
+            while let Some(result) = event_stream.next().await {
+                let event = match result {
                     Ok(e) => e,
                     Err(e) => {
                         tracing::error!("Error reading terminal event: {}", e);
@@ -202,7 +197,7 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
                     }
                 };
 
-                let result: ClientResult<()> = tokio::runtime::Handle::current().block_on(async {
+                let result: ClientResult<()> = async {
                     match &event {
                         termina::Event::Key(key_event) => {
                             if key_event.kind != termina::event::KeyEventKind::Press {
@@ -260,7 +255,8 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
                         _ => {}
                     }
                     Ok(())
-                });
+                }
+                .await;
 
                 if let Err(e) = result {
                     tracing::warn!("Error handling input event: {}", e);
@@ -270,25 +266,32 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
             Ok::<_, ClientError>(())
         })
     } else {
-        tokio::task::spawn_blocking(|| Ok::<_, ClientError>(()))
+        local_set.spawn_local(async { Ok::<_, ClientError>(()) })
     };
 
     // wait for either task to complete
     // we want to ensure we don't hang if the server never responds after CTRL+C
     // if one branch completes, the other future is automatically dropped
-    let exit_code = tokio::select! {
-        result = output_task => {
-            // task completed
-            result??
-        }
-        result = input_task => {
-            result??;
-            tracing::debug!("Input task exited, returning exit code 130 (interrupted)");
-            130 // SIGINT
-        }
-    };
+    let exit_code: ClientResult<i32> = local_set
+        .run_until(async {
+            let exit_code = tokio::select! {
+                result = output_task => {
+                    // task completed
+                    result??
+                }
+                result = input_task => {
+                    result??;
+                    tracing::debug!("Input task exited, returning exit code 130 (interrupted)");
+                    130 // SIGINT
+                }
+            };
+            Ok(exit_code)
+        })
+        .await;
 
-    // cleanup gets done trough the RawModeGuard drop
+    let exit_code = exit_code?;
+
+    // cleanup gets done trhough the RawModeGuard drop
 
     Ok(exit_code)
 }
