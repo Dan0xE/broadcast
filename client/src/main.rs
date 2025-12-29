@@ -93,10 +93,14 @@ fn setup_logging(
     debug: bool,
     verbose: bool,
 ) -> ClientResult<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    let dbg = debug || verbose;
-    let level = if dbg { Level::DEBUG } else { Level::INFO };
+    let level = if debug || verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
 
-    if dbg {
+    // write to file if debug is enabled
+    if debug {
         let file_appender = tracing_appender::rolling::daily("logs", "broadcast-client.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
