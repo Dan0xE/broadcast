@@ -5,13 +5,12 @@ edition = "2024"
 
 [dependencies]
 broadcast_protocol = { path = "../protocol" }
+clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-clap = { version = "4", features = ["derive"] }
-crossterm = "0.29.0"
-termina = { version = "0.1.1", features = ["event-stream"] }
-terminput = "0.5.11"
-futures-util = "0.3"
-tracing-appender = "0.2.4"
+tracing-appender = "0.2"
+crossterm = "0.29"
+termina = { version = "0.1", features = ["event-stream"] }
+terminput = "0.5"

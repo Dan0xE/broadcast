@@ -1,5 +1,7 @@
 ## Broadcast 
 
+*This is a research project / poc, please do not have any expectations towards this project.*
+
 Broadcast is analogous to wsl.exe <exec> and doesn't really do much else, so if wsl.exe works for you, you probably don't need broadcast.
 
 ## Motivation
@@ -27,6 +29,6 @@ Broadcast streams back the result without the user having to switch to WSL. Some
 
 - Let user install aliases (broadcast r / register -c "ls -la" -a ll) so that "ll" will run "ls -la" in WSL
   For that we need to figure out what shell the user is running, powershell, nushell, cmd and need to figure out how to install aliases in these shells
-- TODO point configuration to same path on client / server, enable live reloading of config on the server 
+- TODO configuration file
 - TODO write a proper readme / blog post
 - TODO Give the user an option to address specific distribution with command trough broadcast -d <distro>
