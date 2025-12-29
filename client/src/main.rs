@@ -1,11 +1,8 @@
-use crossterm::event::KeyEvent;
 use std::{
     env,
     io::{IsTerminal, Write, stdout},
-    time::Duration,
 };
-use terminput::Encoding;
-use terminput_crossterm::to_terminput;
+use termina::Terminal as _;
 use tokio::net::TcpStream;
 use tokio::{io::AsyncWriteExt, task::JoinHandle};
 use tracing::Level;
@@ -72,8 +69,8 @@ async fn main() -> ClientResult<()> {
     stream.set_nodelay(true)?;
 
     let terminal_size = if stdin_is_tty {
-        use crossterm::terminal;
-        terminal::size().ok()
+        let terminal = termina::PlatformTerminal::new()?;
+        terminal.get_dimensions().ok().map(|ws| (ws.cols, ws.rows))
     } else {
         None
     };
@@ -116,15 +113,54 @@ fn setup_logging(
     Ok(None)
 }
 
-async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<i32> {
-    use crossterm::{
-        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-        terminal::{disable_raw_mode, enable_raw_mode},
-    };
+struct RawModeGuard {
+    enabled: bool,
+}
 
-    if stdin_is_tty {
-        enable_raw_mode()?
+impl RawModeGuard {
+    fn new(enable: bool) -> ClientResult<Self> {
+        if enable {
+            crossterm::terminal::enable_raw_mode()?;
+        }
+        Ok(Self { enabled: enable })
     }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            use crossterm::{
+                cursor, execute,
+                terminal::{self, Clear, ClearType},
+            };
+
+            let mut stdout = stdout();
+
+            if let Err(e) = terminal::disable_raw_mode() {
+                tracing::error!("Failed to disable raw mode: {}", e);
+            }
+
+            if let Err(e) = execute!(
+                stdout,
+                terminal::LeaveAlternateScreen,
+                cursor::Show,
+                Clear(ClearType::All),
+            ) {
+                tracing::error!("Failed to reset terminal state: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<i32> {
+    // raw mode is disabled even if we return early or panic
+    let _raw_mode_guard = RawModeGuard::new(stdin_is_tty)?;
+
+    let terminal = if stdin_is_tty {
+        Some(termina::PlatformTerminal::new()?)
+    } else {
+        None
+    };
 
     let (mut stream_read, mut stream_write) = stream.into_split();
 
@@ -155,77 +191,181 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
         }
     });
 
-    let input_task = tokio::spawn(async move {
-        loop {
-            if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(KeyEvent {
-                        code: KeyCode::Char('c'),
-                        modifiers: KeyModifiers::CONTROL,
-                        ..
-                    }) => {
-                        let msg = encode_msg(&ClientMessage::Input(vec![3]))?;
-                        stream_write.write_all(&msg).await?;
+    let input_task = if let Some(term) = terminal {
+        tokio::task::spawn_blocking(move || {
+            loop {
+                let event = match term.read(|_| true) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!("Error reading terminal event: {}", e);
                         break;
                     }
-                    Event::Key(KeyEvent {
-                        code: KeyCode::Char('d'),
-                        modifiers: KeyModifiers::CONTROL,
-                        ..
-                    }) => {
-                        let msg = encode_msg(&ClientMessage::Eof)?;
-                        stream_write.write_all(&msg).await?;
-                        break;
-                    }
-                    Event::Key(key_event) => {
-                        if key_event.kind != event::KeyEventKind::Press {
-                            continue;
-                        }
+                };
 
-                        if let Some(bytes) = key_event.to_bytes() {
-                            let msg = encode_msg(&ClientMessage::Input(bytes))?;
+                let result: ClientResult<()> = tokio::runtime::Handle::current().block_on(async {
+                    match &event {
+                        termina::Event::Key(key_event) => {
+                            if key_event.kind != termina::event::KeyEventKind::Press {
+                                return Ok(());
+                            }
+
+                            if key_event.code == termina::event::KeyCode::Char('c')
+                                && key_event
+                                    .modifiers
+                                    .contains(termina::event::Modifiers::CONTROL)
+                            {
+                                let msg = encode_msg(&ClientMessage::Input(vec![3]))?;
+                                stream_write.write_all(&msg).await?;
+                                return Err(ClientError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "Ctrl+C",
+                                )));
+                            }
+
+                            if key_event.code == termina::event::KeyCode::Char('d')
+                                && key_event
+                                    .modifiers
+                                    .contains(termina::event::Modifiers::CONTROL)
+                            {
+                                let msg = encode_msg(&ClientMessage::Eof)?;
+                                stream_write.write_all(&msg).await?;
+                                return Err(ClientError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "Ctrl+D",
+                                )));
+                            }
+
+                            if let Some(bytes) = event_to_bytes(&event) {
+                                let msg = encode_msg(&ClientMessage::Input(bytes))?;
+                                stream_write.write_all(&msg).await?;
+                            }
+                        }
+                        termina::Event::WindowResized(ws) => {
+                            tracing::debug!(
+                                "Resize event: resized to {} cols and {} rows",
+                                ws.cols,
+                                ws.rows
+                            );
+                            let msg = encode_msg(&ClientMessage::Resize(ws.cols, ws.rows))?;
                             stream_write.write_all(&msg).await?;
                         }
+                        event if event.is_escape() => {
+                            tracing::debug!("Received escape sequence (VT response): {:?}", event);
+                            if let Some(bytes) = event_to_bytes(event) {
+                                tracing::debug!("Forwarding VT response bytes to PTY: {:?}", bytes);
+                                let msg = encode_msg(&ClientMessage::Input(bytes))?;
+                                stream_write.write_all(&msg).await?;
+                            }
+                        }
+                        _ => {}
                     }
-                    Event::Resize(cols, rows) => {
-                        tracing::debug!("Resize event: resized to {} cols and {} rows", cols, rows);
-                        let msg = encode_msg(&ClientMessage::Resize(cols, rows))?;
-                        stream_write.write_all(&msg).await?;
-                    }
-                    _ => {}
+                    Ok(())
+                });
+
+                if let Err(e) = result {
+                    tracing::warn!("Error handling input event: {}", e);
+                    break;
                 }
             }
+            Ok::<_, ClientError>(())
+        })
+    } else {
+        tokio::task::spawn_blocking(|| Ok::<_, ClientError>(()))
+    };
+
+    // wait for either task to complete
+    // we want to ensure we don't hang if the server never responds after CTRL+C
+    // if one branch completes, the other future is automatically dropped
+    let exit_code = tokio::select! {
+        result = output_task => {
+            // task completed
+            result??
         }
-        Ok::<_, ClientError>(())
-    });
+        result = input_task => {
+            result??;
+            tracing::debug!("Input task exited, returning exit code 130 (interrupted)");
+            130 // SIGINT
+        }
+    };
 
-    let exit_code = output_task.await??;
-
-    input_task.abort();
-    if stdin_is_tty {
-        disable_raw_mode()?
-    }
+    // cleanup gets done trough the RawModeGuard drop
 
     Ok(exit_code)
 }
 
-// FIXME this doesn't seem to work well with VIM
-// Vim does this weird thing where it will try to query the terminal for its size?
+fn event_to_bytes(event: &termina::Event) -> Option<Vec<u8>> {
+    use terminput::Encoding;
 
-trait KeyEventExt {
-    fn to_bytes(&self) -> Option<Vec<u8>>;
-}
-
-// Forgot the issues that mentioned it, but not a trivial issue fix
-impl KeyEventExt for KeyEvent {
-    fn to_bytes(&self) -> Option<Vec<u8>> {
-        let term_event = to_terminput(crossterm::event::Event::Key(*self)).ok()?;
-
-        let mut buf = [0u8; 32];
-
-        match term_event.encode(&mut buf, Encoding::Xterm) {
-            Ok(len) => Some(buf[..len].to_vec()),
-            Err(_) => None,
+    match event {
+        termina::Event::Key(key) => {
+            let mut buf = [0u8; 32];
+            let event = convert_key_event_to_terminput(key)?;
+            let len = event.encode(&mut buf, Encoding::Xterm).ok()?;
+            Some(buf[..len].to_vec())
+        }
+        _ => {
+            tracing::debug!("Unhandled event type for encoding: {:?}", event);
+            None
         }
     }
+}
+
+fn convert_key_event_to_terminput(key: &termina::event::KeyEvent) -> Option<terminput::Event> {
+    use terminput::{
+        Event, KeyCode, KeyEvent as TermInputKeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    };
+
+    let code = match &key.code {
+        termina::event::KeyCode::Char(c) => KeyCode::Char(*c),
+        termina::event::KeyCode::Enter => KeyCode::Enter,
+        termina::event::KeyCode::Backspace => KeyCode::Backspace,
+        termina::event::KeyCode::Tab => KeyCode::Tab,
+        termina::event::KeyCode::Escape => KeyCode::Esc,
+        termina::event::KeyCode::BackTab => KeyCode::Tab,
+        termina::event::KeyCode::Up => KeyCode::Up,
+        termina::event::KeyCode::Down => KeyCode::Down,
+        termina::event::KeyCode::Left => KeyCode::Left,
+        termina::event::KeyCode::Right => KeyCode::Right,
+        termina::event::KeyCode::Home => KeyCode::Home,
+        termina::event::KeyCode::End => KeyCode::End,
+        termina::event::KeyCode::PageUp => KeyCode::PageUp,
+        termina::event::KeyCode::PageDown => KeyCode::PageDown,
+        termina::event::KeyCode::Delete => KeyCode::Delete,
+        termina::event::KeyCode::Insert => KeyCode::Insert,
+        termina::event::KeyCode::Function(n) => KeyCode::F(*n),
+        termina::event::KeyCode::Null => return None,
+        termina::event::KeyCode::KeypadBegin => return None,
+        termina::event::KeyCode::CapsLock => return None,
+        termina::event::KeyCode::ScrollLock => return None,
+        termina::event::KeyCode::NumLock => return None,
+        termina::event::KeyCode::PrintScreen => return None,
+        termina::event::KeyCode::Pause => return None,
+        termina::event::KeyCode::Menu => return None,
+        termina::event::KeyCode::Modifier(_) => return None,
+        termina::event::KeyCode::Media(_) => return None,
+    };
+
+    let mut modifiers = KeyModifiers::empty();
+    if key.modifiers.contains(termina::event::Modifiers::SHIFT) {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if key.modifiers.contains(termina::event::Modifiers::CONTROL) {
+        modifiers |= KeyModifiers::CTRL;
+    }
+    if key.modifiers.contains(termina::event::Modifiers::ALT) {
+        modifiers |= KeyModifiers::ALT;
+    }
+
+    let kind = match key.kind {
+        termina::event::KeyEventKind::Press => KeyEventKind::Press,
+        termina::event::KeyEventKind::Repeat => KeyEventKind::Repeat,
+        termina::event::KeyEventKind::Release => KeyEventKind::Release,
+    };
+
+    Some(Event::Key(TermInputKeyEvent {
+        code,
+        modifiers,
+        kind,
+        state: KeyEventState::empty(),
+    }))
 }
