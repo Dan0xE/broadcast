@@ -11,6 +11,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
-crossterm = "0.29"
 termina = { version = "0.1", features = ["event-stream"] }
 terminput = "0.5"
