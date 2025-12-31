@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures_util::StreamExt;
 use std::{
     env,
     io::{IsTerminal, Write, stdout},
@@ -89,6 +89,7 @@ async fn main() -> ClientResult<()> {
     std::process::exit(exit_code);
 }
 
+#[cfg(feature = "debug-logging")]
 fn setup_logging(
     debug: bool,
     verbose: bool,
@@ -113,6 +114,21 @@ fn setup_logging(
         tracing::debug!("Debug logging enabled");
         return Ok(Some(guard));
     }
+
+    tracing_subscriber::fmt().with_max_level(level).init();
+    Ok(None)
+}
+
+#[cfg(not(feature = "debug-logging"))]
+fn setup_logging(
+    _debug: bool,
+    verbose: bool,
+) -> ClientResult<Option<()>> {
+    let level = if verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
 
     tracing_subscriber::fmt().with_max_level(level).init();
     Ok(None)
@@ -262,6 +278,7 @@ async fn handle_response(stream: TcpStream, stdin_is_tty: bool) -> ClientResult<
         (task, guard)
     } else {
         let task = local_set.spawn_local(async { Ok::<_, ClientError>(()) });
+        // this might look nonsensical, but we need to keep the RawModeGuard type
         let guard = RawModeGuard::new(None);
         (task, guard)
     };
