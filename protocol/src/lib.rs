@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use bincode::{Decode, Encode, error as BincodeError};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 #[derive(Serialize, Deserialize, Debug, Decode, Encode)]
 pub struct CommandRequest {
@@ -60,7 +61,7 @@ pub fn encode_msg<T: Encode>(msg: &T) -> ProtocolResult<Vec<u8>> {
 }
 
 pub async fn decode_msg<T: Decode<()>>(
-    reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    reader: &mut (impl AsyncReadExt + Unpin),
 ) -> ProtocolResult<T> {
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
